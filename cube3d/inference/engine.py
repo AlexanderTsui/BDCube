@@ -7,6 +7,13 @@ from transformers import CLIPTextModelWithProjection, CLIPTokenizerFast
 from cube3d.inference.logits_postprocesses import process_logits
 from cube3d.inference.utils import load_config, load_model_weights, parse_structured
 from cube3d.model.autoencoder.one_d_autoencoder import OneDAutoEncoder
+from cube3d.model.gpt.block_diffusion_utils import (
+    build_inference_shape_attention_mask,
+    linear_noise_schedule,
+    mask_keep_probability,
+    sample_first_hitting_positions,
+    wrap_shape_attention_with_condition_prefix,
+)
 from cube3d.model.gpt.dual_stream_roformer import DualStreamRoformer
 from cube3d.model.transformers.cache import Cache
 
@@ -77,6 +84,9 @@ class Engine:
         self.max_new_tokens = self.shape_model.cfg.num_encoder_latents
         self.min_id = 0
         self.max_id = self.shape_model.cfg.num_codes
+        self.generation_mode = getattr(self.gpt_model.cfg, "generation_mode", "ar")
+        self.block_size = getattr(self.gpt_model.cfg, "block_size", 1)
+        self.mask_token_id = self.gpt_model.shape_mask_id
 
     @torch.inference_mode()
     def prepare_conditions_with_bbox(
@@ -155,6 +165,19 @@ class Engine:
         return embed, cond
 
     @torch.inference_mode()
+    def prepare_conditions(
+        self,
+        prompts: list[str],
+        bounding_box_xyz: Optional[Tuple[float]] = None,
+    ) -> torch.Tensor:
+        prompt_embeds = self.run_clip(prompts)
+        if bounding_box_xyz is not None:
+            cond_bbox = torch.atleast_2d(torch.tensor(bounding_box_xyz)).to(self.device)
+        else:
+            cond_bbox = None
+        return self.prepare_conditions_with_bbox(prompt_embeds, cond_bbox)
+
+    @torch.inference_mode()
     def run_clip(self, text_inputs):
         """
         Processes the given text inputs using a text tokenizer and a text model, and returns the encoded text embeddings.
@@ -205,6 +228,10 @@ class Engine:
             )
         )
         return bos_embed
+
+    @torch.inference_mode()
+    def encode_shape_tokens(self, shape_ids: torch.Tensor) -> torch.Tensor:
+        return self.gpt_model.encode_token(shape_ids)
 
     @torch.inference_mode()
     def run_gpt(
@@ -285,6 +312,131 @@ class Engine:
         return torch.cat(output_ids, dim=1)
 
     @torch.inference_mode()
+    def run_block_diffusion_gpt(
+        self,
+        prompts: list[str],
+        num_steps: int = 32,
+        top_p: float = None,
+        first_hitting: bool = False,
+        tokens_per_step: int = 1,
+        bounding_box_xyz: Optional[Tuple[float]] = None,
+    ) -> torch.Tensor:
+        cond = self.prepare_conditions(prompts, bounding_box_xyz)
+        batch_size = len(prompts)
+        shape_ids = torch.full(
+            (batch_size, self.max_new_tokens),
+            fill_value=self.mask_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        for block_start in range(0, self.max_new_tokens, self.block_size):
+            block_end = min(block_start + self.block_size, self.max_new_tokens)
+            curr_block_size = block_end - block_start
+
+            if first_hitting:
+                while shape_ids[:, block_start:block_end].eq(self.mask_token_id).any():
+                    block_ids = shape_ids[:, block_start:block_end]
+                    shape_input_ids = torch.cat([shape_ids[:, :block_start], block_ids], dim=1)
+                    shape_embed = self.encode_shape_tokens(shape_input_ids)
+                    shape_position_ids = torch.arange(
+                        shape_input_ids.shape[1], device=self.device, dtype=torch.long
+                    ).unsqueeze(0).expand(batch_size, -1)
+                    shape_mask = build_inference_shape_attention_mask(
+                        context_len=block_start,
+                        block_len=curr_block_size,
+                        device=self.device,
+                    )
+                    attn_mask = wrap_shape_attention_with_condition_prefix(
+                        shape_mask, cond.shape[1]
+                    )
+                    logits = self.gpt_model.forward_block_diffusion(
+                        embed=shape_embed,
+                        cond=cond,
+                        attn_mask=attn_mask,
+                        shape_position_ids=shape_position_ids,
+                    )
+                    block_logits = logits[:, -curr_block_size:, self.min_id : self.max_id]
+                    candidate_ids = process_logits(block_logits, top_p=top_p).squeeze(-1)
+                    mask_positions = block_ids.eq(self.mask_token_id)
+                    update_mask = sample_first_hitting_positions(
+                        mask_positions, tokens_per_step
+                    )
+                    block_ids = torch.where(update_mask, candidate_ids, block_ids)
+                    shape_ids[:, block_start:block_end] = block_ids
+                continue
+
+            step_timesteps = [
+                linear_noise_schedule(step_idx, num_steps)
+                for step_idx in range(num_steps + 1)
+            ]
+            for step_idx in range(num_steps):
+                block_ids = shape_ids[:, block_start:block_end]
+                if not block_ids.eq(self.mask_token_id).any():
+                    break
+
+                shape_input_ids = torch.cat([shape_ids[:, :block_start], block_ids], dim=1)
+                shape_embed = self.encode_shape_tokens(shape_input_ids)
+                shape_position_ids = torch.arange(
+                    shape_input_ids.shape[1], device=self.device, dtype=torch.long
+                ).unsqueeze(0).expand(batch_size, -1)
+                shape_mask = build_inference_shape_attention_mask(
+                    context_len=block_start,
+                    block_len=curr_block_size,
+                    device=self.device,
+                )
+                attn_mask = wrap_shape_attention_with_condition_prefix(
+                    shape_mask, cond.shape[1]
+                )
+                logits = self.gpt_model.forward_block_diffusion(
+                    embed=shape_embed,
+                    cond=cond,
+                    attn_mask=attn_mask,
+                    shape_position_ids=shape_position_ids,
+                )
+                block_logits = logits[:, -curr_block_size:, self.min_id : self.max_id]
+                candidate_ids = process_logits(block_logits, top_p=top_p).squeeze(-1)
+
+                current_t = step_timesteps[step_idx]
+                next_t = step_timesteps[step_idx + 1]
+                keep_probability = mask_keep_probability(current_t, next_t)
+                mask_positions = block_ids.eq(self.mask_token_id)
+                keep_mask = torch.rand_like(block_ids, dtype=torch.float32) < keep_probability
+                keep_mask = keep_mask & mask_positions
+                update_mask = (~keep_mask) & mask_positions
+                block_ids = torch.where(update_mask, candidate_ids, block_ids)
+                shape_ids[:, block_start:block_end] = block_ids
+
+            remaining_mask = shape_ids[:, block_start:block_end].eq(self.mask_token_id)
+            if remaining_mask.any():
+                block_ids = shape_ids[:, block_start:block_end]
+                shape_input_ids = torch.cat([shape_ids[:, :block_start], block_ids], dim=1)
+                shape_embed = self.encode_shape_tokens(shape_input_ids)
+                shape_position_ids = torch.arange(
+                    shape_input_ids.shape[1], device=self.device, dtype=torch.long
+                ).unsqueeze(0).expand(batch_size, -1)
+                shape_mask = build_inference_shape_attention_mask(
+                    context_len=block_start,
+                    block_len=curr_block_size,
+                    device=self.device,
+                )
+                attn_mask = wrap_shape_attention_with_condition_prefix(
+                    shape_mask, cond.shape[1]
+                )
+                logits = self.gpt_model.forward_block_diffusion(
+                    embed=shape_embed,
+                    cond=cond,
+                    attn_mask=attn_mask,
+                    shape_position_ids=shape_position_ids,
+                )
+                block_logits = logits[:, -curr_block_size:, self.min_id : self.max_id]
+                candidate_ids = process_logits(block_logits, top_p=top_p).squeeze(-1)
+                block_ids = torch.where(remaining_mask, candidate_ids, block_ids)
+                shape_ids[:, block_start:block_end] = block_ids
+
+        return shape_ids
+
+    @torch.inference_mode()
     def run_shape_decode(
         self,
         output_ids: torch.Tensor,
@@ -324,6 +476,9 @@ class Engine:
         chunk_size: int = 100_000,
         top_p: float = None,
         bounding_box_xyz: Optional[Tuple[float]] = None,
+        num_diffusion_steps: int = 32,
+        first_hitting: bool = False,
+        first_hitting_tokens_per_step: int = 1,
     ):
         """
         Generates a 3D mesh from text prompts using a GPT model and shape decoder.
@@ -341,9 +496,19 @@ class Engine:
         Returns:
             mesh_v_f: The generated 3D mesh vertices and faces.
         """
-        output_ids = self.run_gpt(
-            prompts, use_kv_cache, guidance_scale, top_p, bounding_box_xyz
-        )
+        if self.generation_mode == "block_diffusion":
+            output_ids = self.run_block_diffusion_gpt(
+                prompts=prompts,
+                num_steps=num_diffusion_steps,
+                top_p=top_p,
+                first_hitting=first_hitting,
+                tokens_per_step=first_hitting_tokens_per_step,
+                bounding_box_xyz=bounding_box_xyz,
+            )
+        else:
+            output_ids = self.run_gpt(
+                prompts, use_kv_cache, guidance_scale, top_p, bounding_box_xyz
+            )
         with torch.autocast(self.device.type, dtype=torch.bfloat16):
             mesh_v_f = self.run_shape_decode(output_ids, resolution_base, chunk_size)
         return mesh_v_f
@@ -371,6 +536,9 @@ class EngineFast(Engine):
         ), "EngineFast is only supported on cuda devices, please use Engine on non-cuda devices"
 
         super().__init__(config_path, gpt_ckpt_path, shape_ckpt_path, device)
+        assert (
+            self.generation_mode == "ar"
+        ), "EngineFast currently only supports autoregressive generation"
 
         # CUDA Graph params
         self.graph = torch.cuda.CUDAGraph()

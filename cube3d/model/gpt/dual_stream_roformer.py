@@ -20,6 +20,10 @@ class DualStreamRoformer(nn.Module):
         n_layer: int = 12
         n_single_layer: int = 0
         rope_theta: float = 1000
+        generation_mode: str = "ar"
+        block_size: int = 8
+        mask_token_id: int = -1
+        use_single_blocks_in_diffusion: bool = False
 
         n_head: int = 16
         n_embd: int = 2048
@@ -80,6 +84,9 @@ class DualStreamRoformer(nn.Module):
         self.shape_bos_id = add_special_token()
         self.shape_eos_id = add_special_token()
         self.padding_id = add_special_token()
+        self.shape_mask_id = (
+            self.padding_id if self.cfg.mask_token_id < 0 else self.cfg.mask_token_id
+        )
 
         self.transformer = nn.ModuleDict(
             dict(
@@ -196,6 +203,162 @@ class DualStreamRoformer(nn.Module):
         ]
         return kv_cache
 
+    def _compute_shape_position_ids(
+        self,
+        batch_size: int,
+        shape_seq_len: int,
+        device: torch.device,
+        shape_position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if shape_position_ids is None:
+            shape_position_ids = torch.arange(
+                shape_seq_len, dtype=torch.long, device=device
+            ).unsqueeze(0)
+            shape_position_ids = shape_position_ids.expand(batch_size, -1)
+        return shape_position_ids
+
+    def _compute_rotary_embeddings(
+        self,
+        batch_size: int,
+        cond_len: int,
+        shape_position_ids: torch.Tensor,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        s_freqs_cis = precompute_freqs_cis(
+            dim=self.cfg.n_embd // self.cfg.n_head,
+            t=shape_position_ids,
+            theta=self.cfg.rope_theta,
+        )
+        cond_position_ids = torch.zeros(
+            [batch_size, cond_len], dtype=torch.long, device=device
+        )
+        dual_position_ids = torch.cat([cond_position_ids, shape_position_ids], dim=1)
+        d_freqs_cis = precompute_freqs_cis(
+            dim=self.cfg.n_embd // self.cfg.n_head,
+            t=dual_position_ids,
+            theta=self.cfg.rope_theta,
+        )
+        return s_freqs_cis, d_freqs_cis
+
+    def _run_blocks(
+        self,
+        embed: torch.Tensor,
+        cond: torch.Tensor,
+        d_freqs_cis: torch.Tensor,
+        s_freqs_cis: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[list[Cache]] = None,
+        curr_pos_id: Optional[torch.Tensor] = None,
+        decode: bool = False,
+        run_single_blocks: bool = True,
+    ) -> torch.Tensor:
+        h = embed
+        c = cond
+
+        layer_idx = 0
+        cond_len = cond.shape[1]
+        for block in self.transformer.dual_blocks:
+            h, c = block(
+                h,
+                c=c,
+                freqs_cis=d_freqs_cis,
+                attn_mask=attn_mask,
+                is_causal=attn_mask is None,
+                kv_cache=kv_cache[layer_idx] if kv_cache is not None else None,
+                curr_pos_id=curr_pos_id + cond_len if curr_pos_id is not None else None,
+                decode=decode,
+            )
+            layer_idx += 1
+
+        if run_single_blocks:
+            for block in self.transformer.single_blocks:
+                h = block(
+                    h,
+                    freqs_cis=s_freqs_cis,
+                    attn_mask=None,
+                    is_causal=True,
+                    kv_cache=kv_cache[layer_idx] if kv_cache is not None else None,
+                    curr_pos_id=curr_pos_id,
+                    decode=decode,
+                )
+                layer_idx += 1
+
+        h = self.transformer.ln_f(h)
+        return self.lm_head(h)
+
+    def forward_ar(
+        self,
+        embed: torch.Tensor,
+        cond: torch.Tensor,
+        kv_cache: Optional[list[Cache]] = None,
+        curr_pos_id: Optional[torch.Tensor] = None,
+        decode: bool = False,
+    ) -> torch.Tensor:
+        batch_size, shape_seq_len = embed.shape[:2]
+        device = embed.device
+
+        attn_mask = torch.tril(
+            torch.ones(
+                cond.shape[1] + shape_seq_len,
+                cond.shape[1] + shape_seq_len,
+                dtype=torch.bool,
+                device=device,
+            )
+        )
+        shape_position_ids = self._compute_shape_position_ids(
+            batch_size, shape_seq_len, device
+        )
+        s_freqs_cis, d_freqs_cis = self._compute_rotary_embeddings(
+            batch_size, cond.shape[1], shape_position_ids, device
+        )
+
+        if kv_cache is not None and decode:
+            assert curr_pos_id is not None
+            embed = embed[:, curr_pos_id, :]
+
+        return self._run_blocks(
+            embed=embed,
+            cond=cond,
+            d_freqs_cis=d_freqs_cis,
+            s_freqs_cis=s_freqs_cis,
+            attn_mask=attn_mask,
+            kv_cache=kv_cache,
+            curr_pos_id=curr_pos_id,
+            decode=decode,
+            run_single_blocks=True,
+        )
+
+    def forward_block_diffusion(
+        self,
+        embed: torch.Tensor,
+        cond: torch.Tensor,
+        attn_mask: torch.Tensor,
+        shape_position_ids: Optional[torch.Tensor] = None,
+        use_single_blocks: Optional[bool] = None,
+    ) -> torch.Tensor:
+        batch_size, shape_seq_len = embed.shape[:2]
+        device = embed.device
+        shape_position_ids = self._compute_shape_position_ids(
+            batch_size, shape_seq_len, device, shape_position_ids
+        )
+        s_freqs_cis, d_freqs_cis = self._compute_rotary_embeddings(
+            batch_size, cond.shape[1], shape_position_ids, device
+        )
+        if use_single_blocks is None:
+            use_single_blocks = self.cfg.use_single_blocks_in_diffusion
+
+        return self._run_blocks(
+            embed=embed,
+            cond=cond,
+            d_freqs_cis=d_freqs_cis,
+            s_freqs_cis=s_freqs_cis,
+            attn_mask=attn_mask.to(device=device, dtype=torch.bool),
+            kv_cache=None,
+            curr_pos_id=None,
+            decode=False,
+            run_single_blocks=use_single_blocks,
+        )
+
     def forward(
         self,
         embed: torch.Tensor,
@@ -203,6 +366,9 @@ class DualStreamRoformer(nn.Module):
         kv_cache: Optional[list[Cache]] = None,
         curr_pos_id: Optional[torch.Tensor] = None,
         decode: bool = False,
+        attn_mask: Optional[torch.Tensor] = None,
+        shape_position_ids: Optional[torch.Tensor] = None,
+        use_single_blocks: Optional[bool] = None,
     ):
         """
         Forward pass for the dual-stream RoFormer model.
@@ -215,70 +381,19 @@ class DualStreamRoformer(nn.Module):
         Returns:
             torch.Tensor: The output logits tensor.
         """
-        b, l = embed.shape[:2]
-        s = cond.shape[1]
-        device = embed.device
-
-        attn_mask = torch.tril(
-            torch.ones(s + l, s + l, dtype=torch.bool, device=device)
-        )
-
-        position_ids = torch.arange(l, dtype=torch.long, device=device)  # shape (t)
-        position_ids = position_ids.unsqueeze_(0).expand(b, -1)
-
-        s_freqs_cis = precompute_freqs_cis(
-            dim=self.cfg.n_embd // self.cfg.n_head,
-            t=position_ids,
-            theta=self.cfg.rope_theta,
-        )
-
-        position_ids = torch.cat(
-            [
-                torch.zeros([b, s], dtype=torch.long, device=position_ids.device),
-                position_ids,
-            ],
-            dim=1,
-        )
-        d_freqs_cis = precompute_freqs_cis(
-            dim=self.cfg.n_embd // self.cfg.n_head,
-            t=position_ids,
-            theta=self.cfg.rope_theta,
-        )
-
-        if kv_cache is not None and decode:
-            assert curr_pos_id is not None
-            embed = embed[:, curr_pos_id, :]
-
-        h = embed
-        c = cond
-
-        layer_idx = 0
-        for block in self.transformer.dual_blocks:
-            h, c = block(
-                h,
-                c=c,
-                freqs_cis=d_freqs_cis,
+        if attn_mask is not None or shape_position_ids is not None:
+            return self.forward_block_diffusion(
+                embed=embed,
+                cond=cond,
                 attn_mask=attn_mask,
-                is_causal=True,
-                kv_cache=kv_cache[layer_idx] if kv_cache is not None else None,
-                curr_pos_id=curr_pos_id + s if curr_pos_id is not None else None,
-                decode=decode,
+                shape_position_ids=shape_position_ids,
+                use_single_blocks=use_single_blocks,
             )
-            layer_idx += 1
-        for block in self.transformer.single_blocks:
-            h = block(
-                h,
-                freqs_cis=s_freqs_cis,
-                attn_mask=None,
-                is_causal=True,
-                kv_cache=kv_cache[layer_idx] if kv_cache is not None else None,
-                curr_pos_id=curr_pos_id,
-                decode=decode,
-            )
-            layer_idx += 1
 
-        # Normalization
-        h = self.transformer.ln_f(h)
-        logits = self.lm_head(h)
-
-        return logits
+        return self.forward_ar(
+            embed=embed,
+            cond=cond,
+            kv_cache=kv_cache,
+            curr_pos_id=curr_pos_id,
+            decode=decode,
+        )

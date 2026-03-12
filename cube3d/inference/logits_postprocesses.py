@@ -51,7 +51,9 @@ def process_logits(
     if top_p is None:
         next_id = torch.argmax(logits, dim=-1, keepdim=True)
     else:
-        logits = top_p_filtering(logits, top_p=0.9)
+        logits = top_p_filtering(logits, top_p=top_p)
         probs = F.softmax(logits, dim=-1)
-        next_id = torch.multinomial(probs, num_samples=1, replacement=True)
+        flat_probs = probs.reshape(-1, probs.shape[-1])
+        next_id = torch.multinomial(flat_probs, num_samples=1, replacement=True)
+        next_id = next_id.view(*probs.shape[:-1], 1)
     return next_id

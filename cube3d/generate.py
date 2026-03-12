@@ -24,6 +24,9 @@ def generate_mesh(
     disable_postprocess=False,
     top_p=None,
     bounding_box_xyz=None,
+    num_diffusion_steps=32,
+    first_hitting=False,
+    first_hitting_tokens_per_step=1,
 ):
     mesh_v_f = engine.t2s(
         [prompt],
@@ -31,6 +34,9 @@ def generate_mesh(
         resolution_base=resolution_base,
         top_p=top_p,
         bounding_box_xyz=bounding_box_xyz,
+        num_diffusion_steps=num_diffusion_steps,
+        first_hitting=first_hitting,
+        first_hitting_tokens_per_step=first_hitting_tokens_per_step,
     )
     vertices, faces = mesh_v_f[0][0], mesh_v_f[0][1]
     obj_path = os.path.join(output_dir, f"{output_name}.obj")
@@ -122,6 +128,24 @@ if __name__ == "__main__":
         default=8.0,
         help="Resolution base for the shape decoder.",
     )
+    parser.add_argument(
+        "--num-diffusion-steps",
+        type=int,
+        default=32,
+        help="Number of block diffusion denoising steps per block.",
+    )
+    parser.add_argument(
+        "--first-hitting",
+        default=False,
+        action="store_true",
+        help="Use first-hitting block diffusion sampling.",
+    )
+    parser.add_argument(
+        "--first-hitting-tokens-per-step",
+        type=int,
+        default=1,
+        help="How many masked tokens to reveal per first-hitting step.",
+    )
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     device = select_device()
@@ -153,6 +177,9 @@ if __name__ == "__main__":
         args.disable_postprocessing,
         args.top_p,
         args.bounding_box_xyz,
+        args.num_diffusion_steps,
+        args.first_hitting,
+        args.first_hitting_tokens_per_step,
     )
     if args.render_gif:
         gif_path = renderer.render_turntable(obj_path, args.output_dir)

@@ -21,6 +21,7 @@ dependencies = [
     "torch>=2.2.2",
     "tqdm",
     "transformers",
+    "safetensors",
     "omegaconf",
     "warp-lang",
     "accelerate>=0.26.0",

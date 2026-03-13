@@ -3,6 +3,7 @@ from typing import Optional
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from cube3d.model.transformers.cache import Cache
 from cube3d.model.transformers.dual_stream_attention import (
@@ -24,6 +25,7 @@ class DualStreamRoformer(nn.Module):
         block_size: int = 8
         mask_token_id: int = -1
         use_single_blocks_in_diffusion: bool = False
+        activation_checkpointing: bool = False
 
         n_head: int = 16
         n_embd: int = 2048
@@ -254,33 +256,85 @@ class DualStreamRoformer(nn.Module):
     ) -> torch.Tensor:
         h = embed
         c = cond
+        use_activation_checkpointing = (
+            self.cfg.activation_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+            and kv_cache is None
+            and not decode
+        )
 
         layer_idx = 0
         cond_len = cond.shape[1]
         for block in self.transformer.dual_blocks:
-            h, c = block(
-                h,
-                c=c,
-                freqs_cis=d_freqs_cis,
-                attn_mask=attn_mask,
-                is_causal=attn_mask is None,
-                kv_cache=kv_cache[layer_idx] if kv_cache is not None else None,
-                curr_pos_id=curr_pos_id + cond_len if curr_pos_id is not None else None,
-                decode=decode,
-            )
+            if use_activation_checkpointing:
+                def dual_block_forward(
+                    x: torch.Tensor,
+                    cond_input: torch.Tensor,
+                    block_module: nn.Module = block,
+                ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+                    return block_module(
+                        x,
+                        c=cond_input,
+                        freqs_cis=d_freqs_cis,
+                        attn_mask=attn_mask,
+                        is_causal=attn_mask is None,
+                        kv_cache=None,
+                        curr_pos_id=None,
+                        decode=False,
+                    )
+
+                h, c = activation_checkpoint(
+                    dual_block_forward,
+                    h,
+                    c,
+                    use_reentrant=False,
+                )
+            else:
+                h, c = block(
+                    h,
+                    c=c,
+                    freqs_cis=d_freqs_cis,
+                    attn_mask=attn_mask,
+                    is_causal=attn_mask is None,
+                    kv_cache=kv_cache[layer_idx] if kv_cache is not None else None,
+                    curr_pos_id=curr_pos_id + cond_len if curr_pos_id is not None else None,
+                    decode=decode,
+                )
             layer_idx += 1
 
         if run_single_blocks:
             for block in self.transformer.single_blocks:
-                h = block(
-                    h,
-                    freqs_cis=s_freqs_cis,
-                    attn_mask=None,
-                    is_causal=True,
-                    kv_cache=kv_cache[layer_idx] if kv_cache is not None else None,
-                    curr_pos_id=curr_pos_id,
-                    decode=decode,
-                )
+                if use_activation_checkpointing:
+                    def single_block_forward(
+                        x: torch.Tensor,
+                        block_module: nn.Module = block,
+                    ) -> torch.Tensor:
+                        return block_module(
+                            x,
+                            freqs_cis=s_freqs_cis,
+                            attn_mask=None,
+                            is_causal=True,
+                            kv_cache=None,
+                            curr_pos_id=None,
+                            decode=False,
+                        )
+
+                    h = activation_checkpoint(
+                        single_block_forward,
+                        h,
+                        use_reentrant=False,
+                    )
+                else:
+                    h = block(
+                        h,
+                        freqs_cis=s_freqs_cis,
+                        attn_mask=None,
+                        is_causal=True,
+                        kv_cache=kv_cache[layer_idx] if kv_cache is not None else None,
+                        curr_pos_id=curr_pos_id,
+                        decode=decode,
+                    )
                 layer_idx += 1
 
         h = self.transformer.ln_f(h)

@@ -174,3 +174,6 @@ cython_debug/
 # Output folder
 outputs/
 model_weights/
+.hf_home
+dataset/
+runs/

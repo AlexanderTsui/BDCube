@@ -1,0 +1,168 @@
+# 4x H20（每卡 96GB）上的“小样本拟合”训练配置。
+# 当前目标不是泛化评测，而是确认模型能否在 3000+ paired-token 样本上稳定拟合。
+
+# 数据根目录。manifest 里的相对路径会相对于这里解析。
+data_root: ./dataset/test0312
+
+# 使用已经预处理好的 token 配对数据。
+manifest_path: ./dataset/test0312/pair_manifest.jsonl
+
+# 不单独划验证集。
+# 这里直接复用训练 manifest 做“train-as-val”监控，目的是观察是否能过拟合。
+val_manifest_path: ./dataset/test0312/pair_manifest.jsonl
+
+# 因为验证集直接复用训练集，这里保持 0。
+val_ratio: 0.0
+
+# Block diffusion 模型结构配置。
+config_path: cube3d/configs/open_model_block_diffusion.yaml
+
+# Cube 预训练 GPT 权重。
+gpt_ckpt_path: model_weights/shape_gpt.safetensors
+
+# Cube shape tokenizer 权重。
+shape_ckpt_path: model_weights/shape_tokenizer.safetensors
+
+# 断点续训时再填 trainer state。
+resume_trainer_state: null
+
+# 不从零开始训练。
+train_from_scratch: false
+
+# 训练输出目录。
+output_dir: ./runs/block_diffusion_overfit_3378_bf16_bs8_4xh20
+
+# 每卡 micro-batch size。
+# 按最新实测建议改为单卡 8。
+batch_size: 8
+
+# paired-token 训练的数据读取不重，但四卡下适当增加 worker 可以减少等数时间。
+num_workers: 4
+
+# 当前不按 step 截断训练。
+max_steps: null
+
+# 由于训练系统必须有停止条件，这里改用 epoch 作为预算。
+# 3378 条样本、4 卡、每卡 batch 8，全局 batch = 32，大约 106 step / epoch。
+# 300 epoch 约等于 3.18 万 step，足够观察是否把训练集吃透。
+epochs: 300
+
+# 小样本拟合阶段直接追求训练集拟合，学习率保持中等偏积极。
+learning_rate: 1.0e-4
+
+# AdamW 权重衰减。
+weight_decay: 0
+
+# 全局梯度裁剪。
+# 这不是防过拟合项，而是防止 BF16 训练早期出现偶发梯度爆炸。
+grad_clip_norm: 1.0
+
+# 不做梯度累计。当前全局 batch = 8 * 4 = 32。
+grad_accum_steps: 1
+
+# 不做长 warmup，避免前期刻意放慢拟合速度。
+# 保留 100 step 仅用于稳定 BF16 训练起步。
+warmup_steps: 100
+
+# 不做学习率衰减，warmup 结束后保持常数学习率，最大化拟合能力。
+min_lr_ratio: 1.0
+
+# 为了更直接观察模型本体是否过拟合，先关闭 EMA。
+ema_decay: 0.0
+
+# 每 1000 step 存一个模型权重，方便回看不同阶段的拟合情况。
+save_model_only_interval: 1000
+
+# 当前主要看拟合，不强调精确断点续训，先关闭完整 trainer state 的周期保存。
+# 这样可以减少 checkpoint I/O 对训练的干扰。
+save_full_state_interval: 0
+
+# 训练结束时不额外保存 `trainer_final.pt`。
+save_final_trainer_state: false
+
+# 训练日志打印间隔。
+log_interval: 10
+
+# 每 1000 step 跑一次“train-as-val”。
+val_interval: 1000
+
+# 这里跑完整个训练集副本，不截断验证 batch。
+val_max_batches: null
+
+# 每 1000 step 做一次 sample generation eval。
+sample_eval_interval: 1000
+
+# 每次固定生成 3 个样本。
+sample_eval_max_samples: 3
+
+# mesh 解码分辨率基准值。
+sample_eval_resolution_base: 8.0
+
+# mesh 解码分块大小。
+sample_eval_chunk_size: 100000
+
+# 这里关闭 top-p，使用更确定性的解码，便于观察是否真的记住训练样本。
+sample_eval_top_p: null
+
+# sample eval 的 block diffusion 去噪步数。
+# 这里取 16，兼顾可观察性和运行开销。
+sample_eval_num_diffusion_steps: 16
+
+# sample eval 默认不用 first-hitting。
+sample_eval_first_hitting: false
+
+# 如果以后打开 first-hitting，每步揭示 2 个 token。
+sample_eval_first_hitting_tokens_per_step: 2
+
+# paired-token 训练路径实际不会在线采样 mesh 点云，这里保留默认值即可。
+point_samples: 8192
+
+# 当前训练不依赖额外缓存。
+cache_dir: null
+
+# 不裁剪训练集和“验证集”。
+max_train_samples: null
+max_val_samples: null
+
+# 训练时每个 block 的 mask 比例区间。
+train_t_min: 0.45
+train_t_max: 0.95
+
+# H20 上优先使用 bf16 autocast。
+amp_dtype: bfloat16
+
+# 模型参数本身也切到 bf16。
+# 这会进一步降低显存占用，但相对 FP32 参数会更激进一些。
+model_dtype: bfloat16
+
+# bf16 下不需要 GradScaler，但这个开关保留默认 false 即可。
+disable_grad_scaler: false
+
+# 先关闭 activation checkpointing，优先保证吞吐。
+# 如果后续要继续把单卡 batch 往上推，再把它改成 true。
+activation_checkpointing: false
+
+# 当前最终训练使用的是 paired token 数据，建议开启这个优化。
+offload_shape_model_to_cpu: true
+
+# 随机种子。
+seed: 0
+
+# 单进程时的设备设定；torchrun 下会自动忽略并改用各自 local rank。
+device: cuda
+
+# 多卡后端。
+ddp_backend: nccl
+
+# 当前 block diffusion 训练路径下有一部分参数并非每一步都会参与 loss。
+# 因此多卡训练需要开启 unused-parameter 检测，否则 DDP 会在首轮迭代后报错退出。
+ddp_find_unused_parameters: true
+
+# TensorBoard 目录。为空时默认写到 `<output_dir>/logs/tensorboard`。
+tensorboard_dir: null
+
+# 保持开启 TensorBoard。
+disable_tensorboard: false
+
+# TensorBoard 刷盘周期。
+tensorboard_flush_secs: 30

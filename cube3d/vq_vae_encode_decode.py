@@ -3,43 +3,10 @@ import logging
 
 import numpy as np
 import torch
-import trimesh
 
 from cube3d.inference.utils import load_config, load_model_weights, parse_structured, select_device
 from cube3d.model.autoencoder.one_d_autoencoder import OneDAutoEncoder
-
-MESH_SCALE = 0.96
-
-
-def rescale(vertices: np.ndarray, mesh_scale: float = MESH_SCALE) -> np.ndarray:
-    """Rescale the vertices to a cube, e.g., [-1, -1, -1] to [1, 1, 1] when mesh_scale=1.0"""
-    vertices = vertices
-    bbmin = vertices.min(0)
-    bbmax = vertices.max(0)
-    center = (bbmin + bbmax) * 0.5
-    scale = 2.0 * mesh_scale / (bbmax - bbmin).max()
-    vertices = (vertices - center) * scale
-    return vertices
-
-
-def load_scaled_mesh(file_path: str) -> trimesh.Trimesh:
-    """
-    Load a mesh and scale it to a unit cube, and clean the mesh.
-    Parameters:
-        file_obj: str | IO
-        file_type: str
-    Returns:
-        mesh: trimesh.Trimesh
-    """
-    mesh: trimesh.Trimesh = trimesh.load(file_path, force="mesh")
-    mesh.remove_infinite_values()
-    mesh.update_faces(mesh.nondegenerate_faces())
-    mesh.update_faces(mesh.unique_faces())
-    mesh.remove_unreferenced_vertices()
-    if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
-        raise ValueError("Mesh has no vertices or faces after cleaning")
-    mesh.vertices = rescale(mesh.vertices)
-    return mesh
+from cube3d.training.data import load_scaled_mesh
 
 
 def load_and_process_mesh(file_path: str, n_samples: int = 8192):

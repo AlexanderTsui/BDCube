@@ -1,9 +1,22 @@
-from cube3d.training.data import ObjaverseDataset, collate_objaverse_batch
+from cube3d.training.data import (
+    DatasetDiscoverySummary,
+    ObjaverseDataset,
+    SampleEvalSpec,
+    collate_objaverse_batch,
+    discover_objaverse_entries,
+    prepare_sample_eval_specs,
+    split_objaverse_entries,
+)
 
 __all__ = [
     "CubeBlockDiffusionTrainer",
+    "DatasetDiscoverySummary",
     "ObjaverseDataset",
+    "SampleEvalSpec",
     "collate_objaverse_batch",
+    "discover_objaverse_entries",
+    "prepare_sample_eval_specs",
+    "split_objaverse_entries",
 ]
 
 

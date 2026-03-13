@@ -1,0 +1,169 @@
+# `cube3d.train_block_diffusion` 的训练配置文件。
+# 命令行传入的参数会覆盖这里的默认值。
+
+# 数据根目录。通常设为项目根目录或 Objaverse 风格数据集根目录。
+data_root: null
+
+# 训练集 manifest 路径。每行一个样本，描述 mesh/text 配对。
+manifest_path: null
+
+# 验证集 manifest 路径。若为空，则从训练集按 `val_ratio` 切分。
+val_manifest_path: null
+
+# 当 `val_manifest_path` 为空时，从训练数据中划出的验证集比例。
+val_ratio: 0.0
+
+# 模型结构配置文件，定义 GPT / block diffusion 的网络结构超参。
+config_path: cube3d/configs/open_model_block_diffusion.yaml
+
+# GPT 初始化权重。通常使用 Cube 预训练的 shape GPT 权重继续训练。
+gpt_ckpt_path: model_weights/shape_gpt.safetensors
+
+# Shape tokenizer / autoencoder 权重。训练和采样解码都依赖它。
+shape_ckpt_path: model_weights/shape_tokenizer.safetensors
+
+# 断点续训时使用的 trainer state 路径，包含 optimizer / scheduler / global_step 等状态。
+resume_trainer_state: null
+
+# 是否允许完全从随机初始化开始训练 GPT。
+# 若为 false，则必须提供 `gpt_ckpt_path` 或 `resume_trainer_state`。
+train_from_scratch: false
+
+# 训练输出目录。日志、checkpoint、sample eval 结果都会写到这里。
+output_dir: ./runs
+
+# 每次 forward 的 batch size。显存不够时优先减小它。
+batch_size: 64
+
+# DataLoader worker 数量。小数据/调试时可设为 0，大训练可适当调高。
+num_workers: 4
+
+# 推荐的训练预算单位：optimizer step。
+# LLM 风格训练通常以 step 控制总训练长度，而不是 epoch。
+max_steps: 50000
+
+# 兼容旧逻辑的 epoch 预算。一般保持为 null，不建议作为主预算方式。
+epochs: null
+
+# AdamW 学习率。
+learning_rate: 1.0e-4
+
+# AdamW 权重衰减。
+weight_decay: 1.0e-2
+
+# 全局梯度裁剪阈值。设为 0 表示关闭。
+grad_clip_norm: 1.0
+
+# 梯度累计步数。等效总 batch size = `batch_size * grad_accum_steps`。
+grad_accum_steps: 1
+
+# 学习率 warmup 的 optimizer step 数。
+warmup_steps: 0
+
+# cosine decay 到最低点时，相对于初始学习率的比例。
+min_lr_ratio: 0.1
+
+# EMA 衰减系数。设为 0 表示关闭 EMA。
+ema_decay: 0.0
+
+# 每隔多少 step 保存一次“仅模型权重”的 checkpoint。
+# 文件较小，适合中途保留多个权重点。
+save_model_only_interval: 0
+
+# 每隔多少 step 保存一次完整 trainer state。
+# 这个文件很大，但可用于精确断点续训。
+save_full_state_interval: 2000
+
+# 训练结束时是否额外保存 `trainer_final.pt`。
+# 通常关闭以避免巨大的最终全状态文件。
+save_final_trainer_state: false
+
+# 每隔多少 step 打一次训练日志。
+log_interval: 10
+
+# 每隔多少 step 跑一次验证。设为 0 表示关闭周期性验证。
+val_interval: 500
+
+# 每次验证最多跑多少个 batch，用于限制验证开销。
+val_max_batches: 8
+
+# 每隔多少 step 跑一次 sample generation eval。
+# 这会真实生成样本，耗时明显高于普通验证。
+sample_eval_interval: 1000
+
+# 每次 sample eval 最多生成多少个样本。
+sample_eval_max_samples: 2
+
+# 解码 mesh 时使用的 marching cubes 分辨率基准值。
+sample_eval_resolution_base: 8.0
+
+# 解码 occupancy / geometry 时的分块大小，用于控制显存占用。
+sample_eval_chunk_size: 100000
+
+# sample eval 采样时的 top-p。为 null 表示不用 top-p 截断。
+sample_eval_top_p: 0.8
+
+# sample eval 去噪时使用的 diffusion step 数。
+sample_eval_num_diffusion_steps: 8
+
+# 是否在 sample eval 中启用 first-hitting 采样。
+sample_eval_first_hitting: false
+
+# first-hitting 模式下，每一步揭示多少个 token。
+sample_eval_first_hitting_tokens_per_step: 2
+
+# 每个 mesh 采样多少个点用于构建训练输入。
+point_samples: 8192
+
+# 预处理缓存目录。若设置，可缓存点云/bbox 等中间结果，加速重复训练。
+cache_dir: null
+
+# 训练集中最多保留多少个样本。调试时可用来裁剪小数据集。
+max_train_samples: null
+
+# 验证集中最多保留多少个样本。调试时可用来限制验证规模。
+max_val_samples: null
+
+# 训练时 block mask 比例下界。为 null 时使用代码默认值。
+train_t_min: null
+
+# 训练时 block mask 比例上界。为 null 时使用代码默认值。
+train_t_max: null
+
+# CUDA autocast 的精度类型。通常 `bfloat16` 更稳。
+amp_dtype: bfloat16
+
+# 模型参数/权重本身使用的数据类型。
+# `float32` 更稳，`bfloat16` 更省显存、更贴近 H20 的优势。
+model_dtype: float32
+
+# 是否禁用 GradScaler。通常只有在 `float16` 调试异常时才会改。
+disable_grad_scaler: false
+
+# 是否开启 GPT activation checkpointing。
+# 开启后可明显降低激活显存，但训练会变慢。
+activation_checkpointing: false
+
+# 是否把冻结的 shape tokenizer 常驻在 CPU。
+# 对 paired-token 训练很有用，因为训练 step 通常不需要它参与前向。
+offload_shape_model_to_cpu: false
+
+# 全局随机种子。
+seed: 0
+
+# 训练设备，如 `cuda`、`cuda:0`、`cpu`。
+device: cuda
+
+# torchrun 多卡训练时使用的分布式后端。
+# NVIDIA GPU 环境通常使用 `nccl`。
+ddp_backend: nccl
+
+# TensorBoard 日志目录。
+# 设为 null 时，默认写到 `<output_dir>/logs/tensorboard`。
+tensorboard_dir: null
+
+# 是否关闭 TensorBoard 标量日志。
+disable_tensorboard: false
+
+# TensorBoard 事件文件的刷盘周期（秒）。
+tensorboard_flush_secs: 30
